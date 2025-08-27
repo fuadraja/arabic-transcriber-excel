@@ -2,137 +2,169 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 from datetime import datetime
-import tempfile
-from mutagen import File as MutagenFile
 from openai import OpenAI
 
-st.set_page_config(page_title="Arabic Transcriber → Excel", page_icon="📝", layout="wide")
-st.title("📝 Arabic Transcriber → Excel")
+# ---------------------- إعدادات الصفحة ----------------------
+st.set_page_config(page_title="تفريغ المقابلات إلى إكسل", page_icon="📝", layout="wide")
+st.title("📝 تفريغ المقابلات الصوتية (عربي) → إكسل")
 
-# --- API key from Streamlit Secrets ---
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
+st.caption("يرجى رفع تسجيلات صوتية بالعربية. سنُفرِّغ النص ونحفظ النتائج في ملف إكسل بالأعمدة المطلوبة.")
+
+# ---------------------- مفتاح OpenAI ----------------------
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") if "OPENAI_API_KEY" in st.secrets else None
+
 if not OPENAI_API_KEY:
-    st.warning("Add OPENAI_API_KEY in App → Settings → Secrets before running.", icon="⚠️")
+    with st.expander("🔐 أدخل مفتاح OpenAI API (اختياري إذا لم تستطع استخدام Secrets)"):
+        OPENAI_API_KEY = st.text_input(
+            "OPENAI_API_KEY",
+            type="password",
+            placeholder="sk-********************************",
+            help="سيُستخدم فقط في جلستك الحالية، ولن يُحفظ على الخادم.",
+        )
 
-# Sidebar: self-fill defaults for all rows
-st.sidebar.header("Defaults (apply to all rows)")
-project = st.sidebar.text_input("Project", value=st.session_state.get("project", "My Project"))
-client = st.sidebar.text_input("Client", value=st.session_state.get("client", ""))
-speaker = st.sidebar.text_input("Speaker / Agent", value=st.session_state.get("speaker", ""))
-notes = st.sidebar.text_area("Notes (applied to all)", value=st.session_state.get("notes", ""))
+if not OPENAI_API_KEY:
+    st.info("لأفضل أمان، أضِف المفتاح في Settings → Secrets على Streamlit Cloud. أو أدخله مؤقتًا أعلاه.", icon="🔑")
 
-extra_help = "Optional lines like: Key=Value\nExample:\nCallType=Inbound\nPriority=Normal"
-extra_kv = st.sidebar.text_area("Extra fields (key=value per line)", value="CallType=Inbound\nPriority=Normal", help=extra_help)
+# ---------------------- اختيار نموذج التفريغ ----------------------
+with st.sidebar:
+    st.header("⚙️ الإعدادات")
+    model = st.selectbox(
+        "نموذج التفريغ (يفضّل الأول)",
+        options=[
+            "gpt-4o-transcribe",  # مخصص للتفريغ
+            "whisper-1",          # في حال الأول غير متاح في حسابك
+        ],
+        index=0
+    )
+    temperature = st.slider("Temperature (اختياري)", 0.0, 1.0, 0.0, 0.1)
+    st.caption("اتركها 0 للحصول على نص أدقّ بدون تنويعات.")
 
-def parse_kv(text: str):
-    data = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        data[k.strip()] = v.strip()
-    return data
+# ---------------------- حقول البيانات (تملأ ذاتياً لكل ملف) ----------------------
+with st.form("meta_form", clear_on_submit=False):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        company = st.text_input("اسم الشركة")
+        employee = st.text_input("اسم الموظف")
+    with col2:
+        job_title = st.text_input("الوظيفة")
+        experience = st.text_input("الخبرة", placeholder="مثال: 5 سنوات")
+    with col3:
+        specialization = st.text_input("الاختصاص")
+        auto_fill = st.checkbox("استخدام هذه القيم لكل الملفات", value=True)
 
-extra_fields = parse_kv(extra_kv)
+    uploaded_files = st.file_uploader(
+        "ارفع ملفات الصوت (MP3/WAV/M4A/MP4). يمكن اختيار أكثر من ملف",
+        type=["mp3", "wav", "m4a", "mp4"],
+        accept_multiple_files=True
+    )
 
-# Transcription settings
-st.sidebar.header("Transcription")
-model = st.sidebar.selectbox("Model", ["whisper-1", "gpt-4o-mini-transcribe"], index=0, help="Whisper-1 is recommended.")
-language = st.sidebar.selectbox("Recording language", ["ar", "auto"], index=0)
+    submit = st.form_submit_button("بدء التفريغ ▶️")
 
-st.markdown("**Upload one or more audio files** (mp3, m4a, wav, ogg, webm).")
-uploaded_files = st.file_uploader("Audio files", type=["mp3", "m4a", "wav", "ogg", "webm"], accept_multiple_files=True)
-
-default_xlsx = f"transcripts_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-xlsx_name = st.text_input("Excel output filename", value=default_xlsx)
-go = st.button("🚀 Transcribe")
-
-# persist sidebar inputs
-st.session_state["project"] = project
-st.session_state["client"] = client
-st.session_state["speaker"] = speaker
-st.session_state["notes"] = notes
-
-def detect_duration_seconds(tmp_path: str):
+# ---------------------- الدالة: تفريغ ملف ----------------------
+def transcribe_file(client: OpenAI, file):
+    """
+    يعيد نصًا مُفرّغًا باللغة العربية من ملف صوتي.
+    """
+    # نمرّر الملف مباشرة دون تحويل
     try:
-        m = MutagenFile(tmp_path)
-        if m is not None and getattr(m, "info", None) and getattr(m.info, "length", None):
-            return round(float(m.info.length), 2)
-    except Exception:
-        pass
-    return None
+        # واجهة OpenAI SDK الحديثة
+        # gpt-4o-transcribe أو whisper-1
+        transcript = client.audio.transcriptions.create(
+            model=model,
+            file=(file.name, file.read()),
+            # التوجيه للغة العربية قد يساعد
+            language="ar",
+            temperature=temperature,
+            response_format="text",
+        )
+        # transcript يكون نصًا خامًا عند response_format="text"
+        if isinstance(transcript, str):
+            return transcript.strip()
+        # احتياط في بعض الإصدارات
+        return getattr(transcript, "text", "").strip()
+    finally:
+        file.seek(0)  # لإرجاع المؤشر في حال احتجناه لاحقًا
 
-@st.cache_data(show_spinner=False)
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Transcripts")
-    return bio.getvalue()
-
-if go:
+# ---------------------- التنفيذ ----------------------
+if submit:
     if not OPENAI_API_KEY:
-        st.error("Missing OPENAI_API_KEY secret.", icon="❌")
-        st.stop()
-    if not uploaded_files:
-        st.error("Please upload at least one audio file.", icon="📎")
+        st.error("الرجاء إدخال مفتاح OpenAI API أولًا.", icon="🚫")
         st.stop()
 
-    client_api = OpenAI(api_key=OPENAI_API_KEY)
+    if not uploaded_files:
+        st.warning("الرجاء رفع ملف صوتي واحد على الأقل.", icon="📎")
+        st.stop()
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
     rows = []
-    progress = st.progress(0.0)
+    progress = st.progress(0)
     status = st.empty()
 
-    for idx, f in enumerate(uploaded_files, start=1):
-        status.info(f"Transcribing: {f.name}")
-
-        suffix = ""
-        if "." in f.name:
-            suffix = "." + f.name.rsplit(".", 1)[-1].lower()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(f.getbuffer())
-            tmp_path = tmp.name
-
-        duration = detect_duration_seconds(tmp_path)
+    for i, f in enumerate(uploaded_files, start=1):
+        status.info(f"جارٍ تفريغ: {f.name} ...")
+        # نحدد القيم المستخدمة لهذا الملف
+        _company = company if auto_fill else st.session_state.get(f"company_{i}", company)
+        _employee = employee if auto_fill else st.session_state.get(f"employee_{i}", employee)
+        _job = job_title if auto_fill else st.session_state.get(f"job_{i}", job_title)
+        _exp = experience if auto_fill else st.session_state.get(f"exp_{i}", experience)
+        _spec = specialization if auto_fill else st.session_state.get(f"spec_{i}", specialization)
 
         try:
-            kwargs = {
-                "model": model,
-                "file": open(tmp_path, "rb"),
-                "response_format": "text",
-            }
-            if language != "auto":
-                kwargs["language"] = "ar"
-
-            text_result = client_api.audio.transcriptions.create(**kwargs)
-            transcript_text = text_result if isinstance(text_result, str) else getattr(text_result, "text", "")
+            text = transcribe_file(client, f)
         except Exception as e:
-            transcript_text = f"[ERROR] {type(e).__name__}: {e}"
+            text = f"خطأ أثناء التفريغ: {e}"
 
         row = {
-            "Project": project,
-            "Client": client,
-            "Speaker": speaker,
-            "RecordingDate": datetime.today().date().isoformat(),
-            "FileName": f.name,
-            "DurationSec": duration,
-            "Language": "ar" if language != "auto" else "auto",
-            "Transcript": transcript_text,
-            "Notes": notes,
+            "اسم الشركة": _company or "",
+            "اسم الموظف": _employee or "",
+            "الوظيفة": _job or "",
+            "الخبرة": _exp or "",
+            "الاختصاص": _spec or "",
+            "المقابلة (النص المفرغ)": text or "",
         }
-        row.update(extra_fields)
         rows.append(row)
-        progress.progress(idx / len(uploaded_files))
+        progress.progress(i / len(uploaded_files))
 
-    status.success("Done ✔️")
-    df = pd.DataFrame(rows)
-    st.subheader("Preview")
-    st.dataframe(df, use_container_width=True, height=400)
+    status.success("اكتمل التفريغ ✅")
 
-    excel_bytes = to_excel_bytes(df)
+    # ---------------------- إنشاء DataFrame وملفات التحميل ----------------------
+    df = pd.DataFrame(rows, columns=["اسم الشركة", "اسم الموظف", "الوظيفة", "الخبرة", "الاختصاص", "المقابلة (النص المفرغ)"])
+
+    st.subheader("📄 المعاينة")
+    st.dataframe(df, use_container_width=True)
+
+    # Excel
+    excel_buffer = BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="النتائج")
+    excel_buffer.seek(0)
+
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_name = f"تفريغ_المقابلات_{now}.xlsx"
+
     st.download_button(
-        "⬇️ Download Excel",
-        data=excel_bytes,
-        file_name=xlsx_name,
+        label="⬇️ تحميل إكسل",
+        data=excel_buffer,
+        file_name=excel_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    # CSV (اختياري)
+    csv_data = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="⬇️ تحميل CSV (UTF-8)",
+        data=csv_data,
+        file_name=f"تفريغ_المقابلات_{now}.csv",
+        mime="text/csv"
+    )
+
+# ---------------------- تلميحات ----------------------
+with st.expander("💡 ملاحظات هامة"):
+    st.markdown(
+        """
+- يعمل التطبيق على Streamlit Cloud بدون الحاجة إلى تثبيت مكتبات فيديو/صوت معقّدة.
+- إذا لم يعمل النموذج **gpt-4o-transcribe** على حسابك، جرّب **whisper-1** من الشريط الجانبي.
+- لا تقم بحفظ مفتاحك داخل الكود أو GitHub. استخدم **Secrets** أو الحقل المؤقت داخل التطبيق.
+        """
     )
