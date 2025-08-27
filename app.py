@@ -1,206 +1,170 @@
-import io
-import mimetypes
-import requests
-import pandas as pd
 import streamlit as st
+import pandas as pd
+from io import BytesIO
+from datetime import datetime
+from openai import OpenAI
 
-# ---------- إعداد الصفحة ----------
-st.set_page_config(page_title="تفريغ المقابلات الصوتية", page_icon="🎙️", layout="wide")
-st.title("🎙️ تفريغ المقابلات الصوتية (عربي) → Excel")
+# ---------------------- إعدادات الصفحة ----------------------
+st.set_page_config(page_title="تفريغ المقابلات إلى إكسل", page_icon="📝", layout="wide")
+st.title("📝 تفريغ المقابلات الصوتية (عربي) → إكسل")
 
-# ---------- التحقق من المفتاح ----------
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+st.caption("يرجى رفع تسجيلات صوتية بالعربية. سنُفرِّغ النص ونحفظ النتائج في ملف إكسل بالأعمدة المطلوبة.")
+
+# ---------------------- مفتاح OpenAI ----------------------
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") if "OPENAI_API_KEY" in st.secrets else None
+
 if not OPENAI_API_KEY:
-    st.error("⚠️ لم يتم العثور على مفتاح OpenAI في الأسرار. اذهب إلى Settings → Secrets وأضف OPENAI_API_KEY.")
-    st.stop()
+    with st.expander("🔐 أدخل مفتاح OpenAI API (اختياري إذا لم تستطع استخدام Secrets)"):
+        OPENAI_API_KEY = st.text_input(
+            "OPENAI_API_KEY",
+            type="password",
+            placeholder="sk-********************************",
+            help="سيُستخدم فقط في جلستك الحالية، ولن يُحفظ على الخادم.",
+        )
 
-# ---------- دوال مساعدة ----------
-TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
-MODEL_NAME = "whisper-1"  # نموذج Whisper الرسمي
+if not OPENAI_API_KEY:
+    st.info("لأفضل أمان، أضِف المفتاح في Settings → Secrets على Streamlit Cloud. أو أدخله مؤقتًا أعلاه.", icon="🔑")
 
-HEADERS = {
-    "Authorization": f"Bearer {OPENAI_API_KEY}"
-}
+# ---------------------- اختيار نموذج التفريغ ----------------------
+with st.sidebar:
+    st.header("⚙️ الإعدادات")
+    model = st.selectbox(
+        "نموذج التفريغ (يفضّل الأول)",
+        options=[
+            "gpt-4o-transcribe",  # مخصص للتفريغ
+            "whisper-1",          # في حال الأول غير متاح في حسابك
+        ],
+        index=0
+    )
+    temperature = st.slider("Temperature (اختياري)", 0.0, 1.0, 0.0, 0.1)
+    st.caption("اتركها 0 للحصول على نص أدقّ بدون تنويعات.")
 
-def safe_mime(filename: str) -> str:
-    mt, _ = mimetypes.guess_type(filename)
-    return mt or "application/octet-stream"
+# ---------------------- حقول البيانات (تملأ ذاتياً لكل ملف) ----------------------
+with st.form("meta_form", clear_on_submit=False):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        company = st.text_input("اسم الشركة")
+        employee = st.text_input("اسم الموظف")
+    with col2:
+        job_title = st.text_input("الوظيفة")
+        experience = st.text_input("الخبرة", placeholder="مثال: 5 سنوات")
+    with col3:
+        specialization = st.text_input("الاختصاص")
+        auto_fill = st.checkbox("استخدام هذه القيم لكل الملفات", value=True)
 
-def transcribe_arabic(file_bytes: bytes, filename: str) -> dict:
+    uploaded_files = st.file_uploader(
+        "ارفع ملفات الصوت (MP3/WAV/M4A/MP4). يمكن اختيار أكثر من ملف",
+        type=["mp3", "wav", "m4a", "mp4"],
+        accept_multiple_files=True
+    )
+
+    submit = st.form_submit_button("بدء التفريغ ▶️")
+
+# ---------------------- الدالة: تفريغ ملف ----------------------
+def transcribe_file(client: OpenAI, file):
     """
-    يعيد dict فيها:
-      - ok: bool
-      - text: النص المفرغ (إن نجح)
-      - error: رسالة الخطأ (إن فشل)
+    يعيد نصًا مُفرّغًا باللغة العربية من ملف صوتي.
     """
+    # نمرّر الملف مباشرة دون تحويل
     try:
-        files = {
-            "file": (filename, file_bytes, safe_mime(filename))
-        }
-        data = {
-            "model": MODEL_NAME,
-            "language": "ar"  # إجبار اللغة عربية لتحسين الدقة
-        }
-        resp = requests.post(TRANSCRIBE_URL, headers=HEADERS, files=files, data=data, timeout=120)
-        if resp.status_code == 200:
-            text = resp.json().get("text", "").strip()
-            return {"ok": True, "text": text}
-        else:
-            # إظهار رسالة خطأ واضحة من واجهة OpenAI
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"error": {"message": resp.text}}
-            return {"ok": False, "error": f"Error code: {resp.status_code} - {err}"}
-    except requests.exceptions.RequestException as e:
-        return {"ok": False, "error": f"Network error: {e}"}
+        # واجهة OpenAI SDK الحديثة
+        # gpt-4o-transcribe أو whisper-1
+        transcript = client.audio.transcriptions.create(
+            model=model,
+            file=(file.name, file.read()),
+            # التوجيه للغة العربية قد يساعد
+            language="ar",
+            temperature=temperature,
+            response_format="text",
+        )
+        # transcript يكون نصًا خامًا عند response_format="text"
+        if isinstance(transcript, str):
+            return transcript.strip()
+        # احتياط في بعض الإصدارات
+        return getattr(transcript, "text", "").strip()
+    finally:
+        file.seek(0)  # لإرجاع المؤشر في حال احتجناه لاحقًا
 
+# ---------------------- التنفيذ ----------------------
+if submit:
+    if not OPENAI_API_KEY:
+        st.error("الرجاء إدخال مفتاح OpenAI API أولًا.", icon="🚫")
+        st.stop()
 
-# ---------- واجهة الإدخال العامة ----------
-st.markdown("#### الخطوة 1: الإعدادات الافتراضية (يمكن تعديلها لكل ملف لاحقًا)")
-colA, colB, colC, colD, colE = st.columns(5)
-with colA:
-    default_company = st.text_input("اسم الشركة (افتراضي)", value="")
-with colB:
-    default_employee = st.text_input("اسم الموظف (افتراضي)", value="")
-with colC:
-    default_role = st.text_input("الوظيفة (افتراضي)", value="")
-with colD:
-    default_experience = st.text_input("الخبرة (افتراضي)", value="")
-with colE:
-    default_specialty = st.text_input("الاختصاص (افتراضي)", value="")
+    if not uploaded_files:
+        st.warning("الرجاء رفع ملف صوتي واحد على الأقل.", icon="📎")
+        st.stop()
 
-st.markdown("#### الخطوة 2: ارفع الملفات الصوتية (يمكن رفع عدة ملفات)")
-uploaded_files = st.file_uploader(
-    "الملفات المدعومة: mp3, m4a, wav, webm, ogg …",
-    type=["mp3", "m4a", "wav", "webm", "ogg"],
-    accept_multiple_files=True
-)
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
-if not uploaded_files:
-    st.info("⬆️ ارفع ملفًا واحدًا أو أكثر للمتابعة.")
-    st.stop()
-
-st.divider()
-
-# سننشئ عناصر إدخال لكل ملف داخل Expander
-st.markdown("#### الخطوة 3: أدخل بيانات كل ملف على حدة (اختياري)")
-per_file_inputs = []
-for idx, uf in enumerate(uploaded_files, start=1):
-    with st.expander(f"🗂️ ملف {idx}: {uf.name}", expanded=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            company = st.text_input("اسم الشركة", value=default_company, key=f"company_{idx}")
-        with c2:
-            employee = st.text_input("اسم الموظف", value=default_employee, key=f"employee_{idx}")
-        with c3:
-            role = st.text_input("الوظيفة", value=default_role, key=f"role_{idx}")
-
-        c4, c5 = st.columns(2)
-        with c4:
-            experience = st.text_input("الخبرة", value=default_experience, key=f"experience_{idx}")
-        with c5:
-            specialty = st.text_input("الاختصاص", value=default_specialty, key=f"specialty_{idx}")
-
-        per_file_inputs.append({
-            "filename": uf.name,
-            "company": company.strip(),
-            "employee": employee.strip(),
-            "role": role.strip(),
-            "experience": experience.strip(),
-            "specialty": specialty.strip(),
-            "file_obj": uf
-        })
-
-st.divider()
-
-# ---------- تنفيذ التفريغ ----------
-if st.button("🚀 بدء التفريغ لجميع الملفات", type="primary"):
-    results = []
-    errors = []
-
+    rows = []
     progress = st.progress(0)
-    status_area = st.empty()
+    status = st.empty()
 
-    for i, item in enumerate(per_file_inputs, start=1):
-        status_area.info(f"جاري تفريغ: {item['filename']} ({i}/{len(per_file_inputs)}) ...")
-        file_bytes = item["file_obj"].read()
-        item["file_obj"].seek(0)
+    for i, f in enumerate(uploaded_files, start=1):
+        status.info(f"جارٍ تفريغ: {f.name} ...")
+        # نحدد القيم المستخدمة لهذا الملف
+        _company = company if auto_fill else st.session_state.get(f"company_{i}", company)
+        _employee = employee if auto_fill else st.session_state.get(f"employee_{i}", employee)
+        _job = job_title if auto_fill else st.session_state.get(f"job_{i}", job_title)
+        _exp = experience if auto_fill else st.session_state.get(f"exp_{i}", experience)
+        _spec = specialization if auto_fill else st.session_state.get(f"spec_{i}", specialization)
 
-        out = transcribe_arabic(file_bytes, item["filename"])
-        if out["ok"]:
-            row = {
-                "اسم الملف": item["filename"],  # مفيد للتمييز بين الصفوف
-                "اسم الشركة": item["company"],
-                "اسم الموظف": item["employee"],
-                "الوظيفة": item["role"],
-                "الخبرة": item["experience"],
-                "الاختصاص": item["specialty"],
-                "المقابلة (النص المفرغ)": out["text"]
-            }
-            results.append(row)
-        else:
-            # نسجّل صفًا مع رسالة الخطأ (لو أردت إهمال الصف، احذف هذا القسم)
-            row = {
-                "اسم الملف": item["filename"],
-                "اسم الشركة": item["company"],
-                "اسم الموظف": item["employee"],
-                "الوظيفة": item["role"],
-                "الخبرة": item["experience"],
-                "الاختصاص": item["specialty"],
-                "المقابلة (النص المفرغ)": f"خطأ أثناء التفريغ: {out['error']}"
-            }
-            results.append(row)
-            errors.append(f"❌ {item['filename']}: {out['error']}")
+        try:
+            text = transcribe_file(client, f)
+        except Exception as e:
+            text = f"خطأ أثناء التفريغ: {e}"
 
-        progress.progress(i / len(per_file_inputs))
+        row = {
+            "اسم الشركة": _company or "",
+            "اسم الموظف": _employee or "",
+            "الوظيفة": _job or "",
+            "الخبرة": _exp or "",
+            "الاختصاص": _spec or "",
+            "المقابلة (النص المفرغ)": text or "",
+        }
+        rows.append(row)
+        progress.progress(i / len(uploaded_files))
 
-    status_area.empty()
+    status.success("اكتمل التفريغ ✅")
 
-    # ---------- عرض النتائج وجدول ملخّص ----------
-    df = pd.DataFrame(results, columns=[
-        "اسم الملف",
-        "اسم الشركة",
-        "اسم الموظف",
-        "الوظيفة",
-        "الخبرة",
-        "الاختصاص",
-        "المقابلة (النص المفرغ)"
-    ])
+    # ---------------------- إنشاء DataFrame وملفات التحميل ----------------------
+    df = pd.DataFrame(rows, columns=["اسم الشركة", "اسم الموظف", "الوظيفة", "الخبرة", "الاختصاص", "المقابلة (النص المفرغ)"])
 
-    st.success(f"تمت معالجة {len(per_file_inputs)} ملف(ات).")
-    if errors:
-        with st.expander("عرض الأخطاء", expanded=False):
-            for e in errors:
-                st.error(e)
+    st.subheader("📄 المعاينة")
+    st.dataframe(df, use_container_width=True)
 
-    st.subheader("📄 النتائج")
-    st.dataframe(df, use_container_width=True, height=400)
+    # Excel
+    excel_buffer = BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="النتائج")
+    excel_buffer.seek(0)
 
-    # ---------- إنشاء ملف Excel واحد للتنزيل ----------
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="تفريغ المقابلات", index=False)
-    buffer.seek(0)
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_name = f"تفريغ_المقابلات_{now}.xlsx"
 
     st.download_button(
-        label="⬇️ تنزيل Excel مجمّع",
-        data=buffer,
-        file_name="تفريغ_المقابلات.xlsx",
+        label="⬇️ تحميل إكسل",
+        data=excel_buffer,
+        file_name=excel_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    st.caption("يحتوي ملف Excel على صف لكل ملف صوتي. ستجد اسم الملف في العمود الأول للتمييز.")
+    # CSV (اختياري)
+    csv_data = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="⬇️ تحميل CSV (UTF-8)",
+        data=csv_data,
+        file_name=f"تفريغ_المقابلات_{now}.csv",
+        mime="text/csv"
+    )
 
-
-# ---------- ملاحظات ----------
-with st.expander("ملاحظات وتسعير", expanded=False):
-    st.markdown("""
-- تأكد من أن **مفتاح OpenAI صحيح** ولديك **رصيد كافٍ**؛ أخطاء مثل:
-  - `invalid_api_key` تعني أن المفتاح غير صحيح.
-  - `insufficient_quota (429)` تعني لا يوجد رصيد كافٍ في الحساب.
-- يدعم التطبيق ملفات `mp3, m4a, wav, webm, ogg`.
-- الأعمدة النهائية في Excel:
-  **اسم الشركة | اسم الموظف | الوظيفة | الخبرة | الاختصاص | المقابلة (النص المفرغ)**  
-  تمت إضافة عمود **اسم الملف** لمساعدتك على التمييز بين الصفوف، ويمكنك حذفه لاحقًا إن رغبت.
-""")
+# ---------------------- تلميحات ----------------------
+with st.expander("💡 ملاحظات هامة"):
+    st.markdown(
+        """
+- يعمل التطبيق على Streamlit Cloud بدون الحاجة إلى تثبيت مكتبات فيديو/صوت معقّدة.
+- إذا لم يعمل النموذج **gpt-4o-transcribe** على حسابك، جرّب **whisper-1** من الشريط الجانبي.
+- لا تقم بحفظ مفتاحك داخل الكود أو GitHub. استخدم **Secrets** أو الحقل المؤقت داخل التطبيق.
+        """
+    )
