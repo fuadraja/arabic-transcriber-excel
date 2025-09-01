@@ -2,106 +2,204 @@
 import os
 from io import BytesIO
 from datetime import datetime
+from typing import List, Dict, Any, Tuple
+import tempfile
 
 import streamlit as st
 import pandas as pd
 
-# ---------------------- إعدادات الصفحة ----------------------
-st.set_page_config(page_title="تفريغ المقابلات إلى إكسل", page_icon="📝", layout="wide")
-st.title("📝 تفريغ المقابلات الصوتية (عربي) → إكسل")
-st.caption("ارفع تسجيلات بالعربية لنُفرِّغها نصيًا ونحفظ النتائج في إكسل بالأعمدة المطلوبة. يدعم رفع عدة ملفات وإدخال بيانات مختلفة لكل ملف.")
-
-# ---------------------- مفتاح OpenAI ----------------------
 from openai import OpenAI
+from openai import APIError, AuthenticationError, RateLimitError, BadRequestError
 
+# ========================= إعدادات الصفحة =========================
+st.set_page_config(page_title="تفريغ المقابلات العربية → إكسل", page_icon="📝", layout="wide")
+st.title("📝 تفريغ المقابلات الصوتية (عربي) → إكسل + تحليل نصي (بدون تحويل صيغ)")
+
+st.caption("ارفع ملفات الصوت بصيغة مدعومة، أدخِل بيانات كل ملف (إن رغبت)، سنُفرِّغ النص بالعربية ونُخرج النتائج في ملف إكسل واحد. يمكن أيضًا إجراء تحليل نصي اختياري.")
+
+# ========================= مفاتيح وأمان =========================
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") if "OPENAI_API_KEY" in st.secrets else None
+
 if not OPENAI_API_KEY:
-    with st.expander("🔐 أدخل مفتاح OpenAI API (اختياري إذا لم تستطع استخدام Secrets)"):
+    with st.expander("🔐 أدخِل مفتاح OpenAI API (مؤقت في جلستك فقط)"):
         OPENAI_API_KEY = st.text_input(
             "OPENAI_API_KEY",
             type="password",
             placeholder="sk-********************************",
-            help="سيُستخدم فقط في جلستك الحالية، ولن يُحفظ على الخادم.",
+            help="لأفضل أمان استخدم Settings → Secrets على Streamlit Cloud.",
         )
-if not OPENAI_API_KEY:
-    st.info("لأفضل أمان، أضِف المفتاح في Settings → Secrets على Streamlit Cloud. أو أدخله مؤقتًا أعلاه.", icon="🔑")
 
-# ---------------------- إعدادات في الشريط الجانبي ----------------------
+if not OPENAI_API_KEY:
+    st.info("لن يعمل التفريغ قبل إدخال مفتاح OpenAI API.", icon="🔑")
+
+# ========================= الشريط الجانبي: الإعدادات =========================
 with st.sidebar:
     st.header("⚙️ الإعدادات")
-    model = st.selectbox(
-        "نموذج التفريغ (يفضّل الأول)",
+
+    st.subheader("نموذج التفريغ")
+    asr_model = st.selectbox(
+        "اختر نموذج التفريغ",
         options=["gpt-4o-transcribe", "whisper-1"],
         index=0,
-        help="اختر gpt-4o-transcribe إن كان متاحًا في حسابك؛ وإلا استخدم whisper-1."
+        help="إن لم يتوفر الأول في حسابك جرّب whisper-1."
     )
-    temperature = st.slider("Temperature (اختياري)", 0.0, 1.0, 0.0, 0.1)
-    st.caption("اتركها 0 للحصول على نص أدقّ بدون تنويعات.")
-    st.markdown("---")
-    st.caption("📎 الصيغ المدعومة: flac, m4a, mp3, mp4, mpeg, mpga, oga, ogg, wav, webm")
+    asr_temperature = st.slider("Temperature (تفريغ)", 0.0, 1.0, 0.0, 0.1)
 
-# ---------------------- نموذج إدخال البيانات + رفع الملفات ----------------------
-with st.form("meta_form", clear_on_submit=False):
-    st.subheader("🧾 بيانات افتراضية (يمكن تطبيقها على جميع الملفات)")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        default_company = st.text_input("اسم الشركة (افتراضي)")
-        default_employee = st.text_input("اسم الموظف (افتراضي)")
-    with col2:
-        default_job_title = st.text_input("الوظيفة (افتراضي)")
-        default_experience = st.text_input("الخبرة (افتراضي)", placeholder="مثال: 5 سنوات")
-    with col3:
-        default_specialization = st.text_input("الاختصاص (افتراضي)")
-        auto_fill = st.checkbox("تطبيق القيم الافتراضية على جميع الملفات", value=True)
+    st.subheader("التحليل النصي (اختياري)")
+    enable_nlp = st.checkbox("تفعيل التحليل النصي", value=True, help="ملخص + كلمات مفتاحية + مشاعر + عدد الكلمات.")
+    nlp_model = st.selectbox("نموذج التحليل", options=["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
+    nlp_depth = st.select_slider("تفصيل الملخص", options=["قصير", "متوسط", "مفصل"], value="متوسط")
 
-    uploaded_files = st.file_uploader(
-        "🎧 ارفع ملفات الصوت (يمكن اختيار أكثر من ملف)",
-        type=["flac", "m4a", "mp3", "mp4", "mpeg", "mpga", "oga", "ogg", "wav", "webm"],
-        accept_multiple_files=True
-    )
+    st.subheader("💰 حاسبة التكلفة (تقديري)")
+    st.caption("يمكن تعديل الأسعار يدويًا حسب خطة OpenAI لديك.")
+    price_per_min_gpt4o_transcribe = st.number_input("سعر/دقيقة - gpt-4o-transcribe ($)", value=0.006, min_value=0.0, step=0.001, format="%.3f")
+    price_per_min_whisper = st.number_input("سعر/دقيقة - whisper-1 ($)", value=0.006, min_value=0.0, step=0.001, format="%.3f")
+    price_per_1k_tokens_nlp = st.number_input("سعر/1000 توكن للنموذج التحليلي ($)", value=0.002, min_value=0.0, step=0.001, format="%.3f")
+    st.caption("ملاحظة: الأسعار هنا افتراضية وقابلة للتعديل لتطابق حسابك.")
 
-    # عند عدم استخدام التعبئة التلقائية، نظهر حقولًا لكل ملف
-    if uploaded_files and not auto_fill:
-        st.markdown("### ✏️ بيانات لكل ملف")
-        for idx, f in enumerate(uploaded_files, start=1):
-            with st.expander(f"الملف #{idx} — {f.name}"):
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.text_input("اسم الشركة", key=f"company_{idx}", value=default_company)
-                    st.text_input("اسم الموظف", key=f"employee_{idx}", value=default_employee)
-                with c2:
-                    st.text_input("الوظيفة", key=f"job_{idx}", value=default_job_title)
-                    st.text_input("الخبرة", key=f"exp_{idx}", value=default_experience)
-                with c3:
-                    st.text_input("الاختصاص", key=f"spec_{idx}", value=default_specialization)
+# ========================= أدوات مساعدة =========================
+SUPPORTED_AUDIO = ['flac', 'm4a', 'mp3', 'mp4', 'mpeg', 'mpga', 'oga', 'ogg', 'wav', 'webm']
 
-    submit = st.form_submit_button("بدء التفريغ ▶️")
+def _get_file_ext(name: str) -> str:
+    return (os.path.splitext(name)[1][1:] or "").lower()
 
-# ---------------------- الدالة: تفريغ ملف ----------------------
-def transcribe_file(client: OpenAI, file_obj, model_name: str, temperature_value: float = 0.0) -> str:
+def _safe_duration_seconds(file_name: str, data: bytes) -> float:
     """
-    يُعيد نصًا مُفرّغًا باللغة العربية من ملف صوتي، باستخدام واجهة OpenAI الحديثة.
+    يحاول قراءة مدة الصوت باستخدام mutagen (بدون FFmpeg).
+    إن فشل لسبب ما، يعيد -1.
     """
-    # نقرأ المحتوى مرة واحدة ثم نعيد المؤشر
-    content = file_obj.read()
-    file_obj.seek(0)
+    try:
+        from mutagen import File as MutagenFile
+        with tempfile.NamedTemporaryFile(delete=True, suffix=f"_{os.path.basename(file_name)}") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            audio = MutagenFile(tmp.name)
+            if audio is not None and getattr(audio, "info", None) and getattr(audio.info, "length", None):
+                return float(audio.info.length)
+        return -1.0
+    except Exception:
+        return -1.0
+
+def transcribe_bytes(client: OpenAI, name: str, content_bytes: bytes, ext: str, language="ar", temperature=0.0) -> str:
+    """
+    يرسل الملف إلى واجهة التفريغ ويُعيد النص العربي.
+    """
     try:
         resp = client.audio.transcriptions.create(
-            model=model_name,
-            file=(file_obj.name, content),
-            language="ar",
-            temperature=temperature_value,
+            model=asr_model,
+            file=(f"{os.path.splitext(name)[0]}.{ext}", content_bytes),
+            language=language,
+            temperature=temperature,
             response_format="text",
         )
         if isinstance(resp, str):
             return resp.strip()
         return getattr(resp, "text", "").strip()
+    except AuthenticationError as e:
+        raise RuntimeError("فشل التوثيق: تحقّق من مفتاح OpenAI API.") from e
+    except RateLimitError as e:
+        raise RuntimeError("تجاوزت الحصة/المعدل. راجع خطتك أو أعد المحاولة لاحقًا.") from e
+    except BadRequestError as e:
+        raise RuntimeError(f"طلب غير صالح: {e}") from e
+    except APIError as e:
+        raise RuntimeError(f"خطأ من خادم OpenAI: {e}") from e
     except Exception as e:
-        # تُعاد الرسالة كـ نصّ ضمن الحقل
-        return f"خطأ أثناء التفريغ: {e}"
+        raise RuntimeError(f"حدث خطأ أثناء التفريغ: {e}") from e
 
-# ---------------------- التنفيذ ----------------------
-df = None
+def analyze_text(client: OpenAI, text: str, depth: str) -> Dict[str, Any]:
+    """
+    تحليل نصي بسيط:
+    - ملخص (حسب العمق)
+    - كلمات مفتاحية
+    - مشاعر عامة
+    - عدد الكلمات
+    """
+    wc = len(text.split())
+    if not text.strip():
+        return {"ملخص": "", "كلمات مفتاحية": "", "المشاعر": "", "عدد الكلمات": 0}
+
+    prompt = f"""حلّل النص العربي التالي بإيجاز ووضوح:
+- قدّم ملخصًا ({depth}) من 3-6 جمل بحسب العمق.
+- استخرج حتى 8 كلمات/عبارات مفتاحية (comma-separated).
+- قيّم المشاعر العامة (إيجابي/محايد/سلبي) مع جملة تفسيرية قصيرة.
+أعد الإجابة بصيغة JSON بالمفاتيح: summary, keywords, sentiment.
+النص:
+{text}"""
+
+    try:
+        comp = client.chat.completions.create(
+            model=nlp_model,
+            messages=[
+                {"role": "system", "content": "أنت مساعد خبير في تحليل النصوص العربية."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        raw = comp.choices[0].message.content.strip()
+        import json, re
+        match = re.search(r'\{.*\}', raw, re.S)
+        data = {}
+        if match:
+            data = json.loads(match.group(0))
+        else:
+            data = {"summary": raw, "keywords": "", "sentiment": ""}
+
+        return {
+            "ملخص": data.get("summary", ""),
+            "كلمات مفتاحية": data.get("keywords", ""),
+            "المشاعر": data.get("sentiment", ""),
+            "عدد الكلمات": wc,
+        }
+    except Exception:
+        return {"ملخص": "", "كلمات مفتاحية": "", "المشاعر": "", "عدد الكلمات": wc}
+
+def minutes_from_seconds(sec: float) -> float:
+    return max(0.0, round(sec / 60.0, 2)) if sec and sec > 0 else 0.0
+
+# ========================= الإدخال: الملفات + بيانات لكل ملف =========================
+with st.form("upload_form", clear_on_submit=False):
+    st.subheader("📥 رفع الملفات")
+    uploaded_files = st.file_uploader(
+        "ارفع ملفات الصوت (يدعم: " + ", ".join(SUPPORTED_AUDIO) + ")",
+        type=SUPPORTED_AUDIO,
+        accept_multiple_files=True
+    )
+
+    st.markdown("—")
+    st.subheader("🧾 بيانات عامة (تُستخدم افتراضيًا لكل الملفات)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        default_company = st.text_input("اسم الشركة (افتراضي)")
+        default_employee = st.text_input("اسم الموظف (افتراضي)")
+    with c2:
+        default_job = st.text_input("الوظيفة (افتراضي)")
+        default_exp = st.text_input("الخبرة (افتراضي)", placeholder="مثال: 5 سنوات")
+    with c3:
+        default_spec = st.text_input("الاختصاص (افتراضي)")
+        per_file_overrides = st.checkbox("سأدخل بيانات مختلفة لكل ملف", value=True)
+
+    per_file_meta: List[Dict[str, str]] = []
+    if uploaded_files and per_file_overrides:
+        st.markdown("—")
+        st.subheader("✍️ بيانات مخصّصة لكل ملف")
+        for idx, f in enumerate(uploaded_files, start=1):
+            with st.expander(f"الملف #{idx}: {f.name}", expanded=False):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    comp = st.text_input(f"اسم الشركة #{idx}", key=f"company_{idx}", value=default_company)
+                    emp = st.text_input(f"اسم الموظف #{idx}", key=f"employee_{idx}", value=default_employee)
+                with col2:
+                    job = st.text_input(f"الوظيفة #{idx}", key=f"job_{idx}", value=default_job)
+                    exp = st.text_input(f"الخبرة #{idx}", key=f"exp_{idx}", value=default_exp)
+                with col3:
+                    spec = st.text_input(f"الاختصاص #{idx}", key=f"spec_{idx}", value=default_spec)
+                per_file_meta.append({
+                    "اسم الشركة": comp, "اسم الموظف": emp, "الوظيفة": job, "الخبرة": exp, "الاختصاص": spec
+                })
+
+    submit = st.form_submit_button("▶️ بدء التفريغ")
+
+# ========================= التنفيذ =========================
 if submit:
     if not OPENAI_API_KEY:
         st.error("الرجاء إدخال مفتاح OpenAI API أولًا.", icon="🚫")
@@ -111,54 +209,73 @@ if submit:
         st.warning("الرجاء رفع ملف صوتي واحد على الأقل.", icon="📎")
         st.stop()
 
+    # تحقّق مبكر من الامتدادات
+    bad_files = [f.name for f in uploaded_files if _get_file_ext(f.name) not in SUPPORTED_AUDIO]
+    if bad_files:
+        st.error(
+            "هذه الملفات غير بصيغة مدعومة، الرجاء تحويلها خارجيًا إلى صيغة مدعومة ثم إعادة الرفع:\n- " + "\n- ".join(bad_files),
+            icon="🚫"
+        )
+        st.stop()
+
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    rows = []
+    results_rows: List[Dict[str, Any]] = []
+    durations_min: List[float] = []
+
     progress = st.progress(0)
     status = st.empty()
 
-    total = len(uploaded_files)
     for i, f in enumerate(uploaded_files, start=1):
-        status.info(f"جارٍ تفريغ: {f.name} ...")
+        status.info(f"جارٍ معالجة: {f.name} ...")
 
-        # اجلب القيم الخاصة بكل ملف إن كانت متاحة، وإلا استخدم الافتراضية
-        if auto_fill:
-            _company = default_company
-            _employee = default_employee
-            _job = default_job_title
-            _exp = default_experience
-            _spec = default_specialization
+        # بيانات هذا الملف
+        if per_file_overrides and len(per_file_meta) >= i:
+            meta = per_file_meta[i-1]
         else:
-            _company = st.session_state.get(f"company_{i}", default_company)
-            _employee = st.session_state.get(f"employee_{i}", default_employee)
-            _job = st.session_state.get(f"job_{i}", default_job_title)
-            _exp = st.session_state.get(f"exp_{i}", default_experience)
-            _spec = st.session_state.get(f"spec_{i}", default_specialization)
+            meta = {
+                "اسم الشركة": default_company,
+                "اسم الموظف": default_employee,
+                "الوظيفة": default_job,
+                "الخبرة": default_exp,
+                "الاختصاص": default_spec,
+            }
+
+        # اقرأ البايتات واحسب مدة تقريبية
+        ext = _get_file_ext(f.name)
+        fbytes = f.read()
+        f.seek(0)
+        duration_sec = _safe_duration_seconds(f.name, fbytes)
 
         # التفريغ
-        text = transcribe_file(client, f, model, temperature)
+        try:
+            text = transcribe_bytes(client, f.name, fbytes, ext, language="ar", temperature=asr_temperature)
+        except Exception as e:
+            text = f"خطأ أثناء التفريغ: {e}"
 
-        row = {
-            "اسم الشركة": _company or "",
-            "اسم الموظف": _employee or "",
-            "الوظيفة": _job or "",
-            "الخبرة": _exp or "",
-            "الاختصاص": _spec or "",
-            "المقابلة (النص المفرغ)": text or "",
-        }
-        rows.append(row)
-        progress.progress(i / total)
+        row = {**meta, "المقابلة (النص المفرغ)": text or ""}
+
+        # التحليل النصي
+        if enable_nlp and text and not str(text).startswith("خطأ"):
+            analysis = analyze_text(client, text, depth=nlp_depth)
+            row.update(analysis)
+        elif enable_nlp:
+            row.update({"ملخص": "", "كلمات مفتاحية": "", "المشاعر": "", "عدد الكلمات": 0})
+
+        results_rows.append(row)
+        durations_min.append(minutes_from_seconds(duration_sec))
+        progress.progress(i / len(uploaded_files))
 
     status.success("اكتمل التفريغ ✅")
 
-    # -------- إنشاء DataFrame وملفات التحميل --------
-    df = pd.DataFrame(
-        rows,
-        columns=["اسم الشركة", "اسم الموظف", "الوظيفة", "الخبرة", "الاختصاص", "المقابلة (النص المفرغ)"]
-    )
+    # ========================= عرض النتائج + التحميل =========================
+    st.subheader("📄 النتائج")
+    cols = ["اسم الشركة", "اسم الموظف", "الوظيفة", "الخبرة", "الاختصاص", "المقابلة (النص المفرغ)"]
+    if enable_nlp:
+        cols += ["ملخص", "كلمات مفتاحية", "المشاعر", "عدد الكلمات"]
 
-    st.subheader("📄 المعاينة")
-    st.dataframe(df, use_container_width=True)
+    df = pd.DataFrame(results_rows, columns=cols)
+    st.dataframe(df, use_container_width=True, height=420)
 
     # Excel
     excel_buffer = BytesIO()
@@ -169,153 +286,57 @@ if submit:
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
     excel_name = f"تفريغ_المقابلات_{now}.xlsx"
 
-    st.download_button(
-        label="⬇️ تحميل إكسل",
-        data=excel_buffer,
-        file_name=excel_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    cdl, cdr = st.columns(2)
+    with cdl:
+        st.download_button(
+            label="⬇️ تحميل إكسل",
+            data=excel_buffer,
+            file_name=excel_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    with cdr:
+        csv_data = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            label="⬇️ تحميل CSV (UTF-8)",
+            data=csv_data,
+            file_name=f"تفريغ_المقابلات_{now}.csv",
+            mime="text/csv"
+        )
 
-    # CSV
-    csv_data = df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        label="⬇️ تحميل CSV (UTF-8)",
-        data=csv_data,
-        file_name=f"تفريغ_المقابلات_{now}.csv",
-        mime="text/csv"
-    )
+    # ========================= حاسبة التكلفة =========================
+    st.subheader("💰 تقدير التكلفة")
+    total_minutes = round(sum(durations_min), 2)
+    st.caption("إن تعذر استخراج المدة من بعض الملفات ستكون الدقائق 0 لهذه العناصر.")
 
-# ========================= سحابة الكلمات (Word Cloud) =========================
-if df is not None and not df.empty:
-    with st.expander("☁️ سحابة الكلمات (Word Cloud)"):
-        enable_wc = st.checkbox("تفعيل توليد سحابة الكلمات", value=True)
-        col_wc1, col_wc2 = st.columns([2, 1])
-        with col_wc1:
-            st.caption("لأفضل عرض عربي، يُفضّل رفع خط عربي (TTF/OTF) مثل Noto Naskh أو Amiri.")
-            font_file = st.file_uploader("📎 خط عربي (اختياري)", type=["ttf", "otf"], key="wc_font")
-        with col_wc2:
-            max_words = st.slider("عدد الكلمات القصوى", 50, 500, 200, 25)
-            bg_white = st.checkbox("خلفية بيضاء", value=True)
+    if asr_model == "gpt-4o-transcribe":
+        asr_cost = total_minutes * float(price_per_min_gpt4o_transcribe)
+    else:
+        asr_cost = total_minutes * float(price_per_min_whisper)
 
-        # كلمات إيقاف عربية بسيطة + ما يضيفه المستخدم
-        default_stopwords = """
-        في على من إلى عن أن إن كان تكون كانوا تكونون هذا هذه ذلك تلك هناك هنا ثم لقد قد مع أو ولا ولم لما ما لا ليس إنه أنها إنهم التي الذي الذين حيث بسبب جدا جدًا خلال بين حتى لدى دون عند قبل بعد مثل أيضًا ايضا إذ اذا إذًا فقط كل أي اي كيف ماذا لماذا متى حينما حيثما أنَّ إنَّ
-        """.split()
-        user_stop = st.text_area("كلمات إيقاف إضافية (افصل بينها بمسافة)", value="")
-        extra_stop = [w.strip() for w in user_stop.split() if w.strip()]
-        arabic_stopwords = set([w for w in default_stopwords + extra_stop if w])
+    total_words = 0
+    if enable_nlp:
+        try:
+            total_words = int(df["عدد الكلمات"].fillna(0).sum())
+        except Exception:
+            total_words = 0
+    est_tokens_nlp = int((total_words * 5) / 4)  # تقدير بسيط
+    nlp_cost = (est_tokens_nlp / 1000.0) * float(price_per_1k_tokens_nlp) if enable_nlp else 0.0
 
-        if enable_wc:
-            try:
-                from wordcloud import WordCloud
-                import matplotlib.pyplot as plt
-                import arabic_reshaper
-                from bidi.algorithm import get_display
+    st.write(f"- **إجمالي الدقائق:** ~ {total_minutes} دقيقة")
+    st.write(f"- **تكلفة التفريغ (ASR):** ~ ${asr_cost:.4f}")
+    if enable_nlp:
+        st.write(f"- **تقدير توكنات التحليل:** ~ {est_tokens_nlp} توكن")
+        st.write(f"- **تكلفة التحليل (NLP):** ~ ${nlp_cost:.4f}")
+    st.markdown(f"**الإجمالي التقديري:** ~ ${asr_cost + nlp_cost:.4f}")
 
-                font_bytes = font_file.read() if font_file is not None else None
-
-                def build_wc_image(text: str, font_bytes_local: bytes | None) -> bytes:
-                    # تهيئة العربية (ربط الحروف + اتجاه)
-                    reshaped = arabic_reshaper.reshape(text)
-                    bidi_text = get_display(reshaped)
-
-                    # استبعاد كلمات الإيقاف يدويًا
-                    tokens = [t for t in bidi_text.split() if t not in arabic_stopwords]
-                    cleaned_text = " ".join(tokens)
-
-                    # إعداد الخط (حفظ مؤقت إذا رُفع)
-                    font_path = None
-                    tmp_font_path = None
-                    if font_bytes_local:
-                        import tempfile
-                        suffix = ".ttf"
-                        tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                        tf.write(font_bytes_local)
-                        tf.flush()
-                        tf.close()
-                        tmp_font_path = tf.name
-                        font_path = tmp_font_path
-
-                    # توليد السحابة
-                    wc = WordCloud(
-                        width=1200,
-                        height=600,
-                        background_color="white" if bg_white else None,
-                        mode="RGBA" if not bg_white else "RGB",
-                        max_words=int(max_words),
-                        font_path=font_path,
-                        collocations=False,
-                    ).generate(cleaned_text)
-
-                    # رسم وحفظ PNG
-                    buf = BytesIO()
-                    fig = plt.figure(figsize=(10, 5))
-                    plt.imshow(wc, interpolation="bilinear")
-                    plt.axis("off")
-                    plt.tight_layout(pad=0)
-                    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight", pad_inches=0)
-                    plt.close(fig)
-                    buf.seek(0)
-
-                    if tmp_font_path and os.path.exists(tmp_font_path):
-                        try:
-                            os.remove(tmp_font_path)
-                        except Exception:
-                            pass
-
-                    return buf.getvalue()
-
-                # سحابة مجمّعة
-                st.subheader("سحابة الكلمات المجمّعة (كل التفريغات)")
-                all_text = " ".join(df["المقابلة (النص المفرغ)"].astype(str).tolist())
-                if all_text.strip():
-                    img_bytes = build_wc_image(all_text, font_bytes)
-                    st.image(img_bytes, use_container_width=True)
-                    st.download_button(
-                        "⬇️ تحميل السحابة المجمّعة (PNG)",
-                        data=img_bytes,
-                        file_name=f"wordcloud_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                        mime="image/png"
-                    )
-                else:
-                    st.info("لا يوجد نص لتوليد سحابة مجمّعة.")
-
-                st.markdown("---")
-
-                # سحب سحابة لكل صف/ملف
-                st.subheader("سحابة كلمات لكل ملف")
-                tabs = st.tabs([f"ملف {i+1}" for i in range(len(df))])
-                for i, tab in enumerate(tabs):
-                    with tab:
-                        text_i = str(df.iloc[i]["المقابلة (النص المفرغ)"])
-                        meta_label = " | ".join(
-                            str(df.iloc[i][c]) for c in ["اسم الشركة", "اسم الموظف", "الوظيفة"]
-                            if c in df.columns
-                        )
-                        st.caption(meta_label)
-                        if text_i.strip():
-                            img_i = build_wc_image(text_i, font_bytes)
-                            st.image(img_i, use_container_width=True)
-                            st.download_button(
-                                f"⬇️ تحميل سحابة ملف #{i+1} (PNG)",
-                                data=img_i,
-                                file_name=f"wordcloud_file_{i+1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                                mime="image/png",
-                                key=f"dl_wc_{i}"
-                            )
-                        else:
-                            st.info("لا يوجد نص في هذا الصف.")
-            except Exception as e:
-                st.warning(f"تعذر توليد سحابة الكلمات: {e}")
-else:
-    st.info("لا توجد بيانات نصية بعد لتوليد سحابة الكلمات.")
-
-# ---------------------- تلميحات ----------------------
+# ========================= ملاحظات =========================
 with st.expander("💡 ملاحظات هامة"):
     st.markdown(
         """
-- يعمل التطبيق على Streamlit Cloud بدون الحاجة إلى مكتبات صوت/فيديو إضافية.
-- إذا لم يعمل النموذج **gpt-4o-transcribe** على حسابك، جرّب **whisper-1** من الشريط الجانبي.
-- لا تحفظ مفتاحك داخل الكود أو GitHub. استخدم **Secrets** أو الحقل المؤقت داخل التطبيق.
+- يدعم التطبيق صيغ الصوت: `flac, m4a, mp3, mp4, mpeg, mpga, oga, ogg, wav, webm`.
+- لا يوجد تحويل صيغ داخل التطبيق لتجنّب مشاكل البناء على Streamlit Cloud.
+- لو ظهرت أخطاء **401** تأكّد من مفتاح OpenAI. لو **429** (حصة/معدل) راجع الفوترة أو أعد المحاولة.
+- الأسعار في الحاسبة **تقديرية** ويمكن تعديلها من الشريط الجانبي.
+- لا تحفظ مفتاحك داخل الكود أو GitHub. استخدم **Secrets** على Streamlit Cloud أو الحقل المؤقت.
         """
     )
