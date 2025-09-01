@@ -3,6 +3,7 @@ import os
 from io import BytesIO
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
+import tempfile
 
 import streamlit as st
 import pandas as pd
@@ -12,9 +13,9 @@ from openai import APIError, AuthenticationError, RateLimitError, BadRequestErro
 
 # ========================= إعدادات الصفحة =========================
 st.set_page_config(page_title="تفريغ المقابلات العربية → إكسل", page_icon="📝", layout="wide")
-st.title("📝 تفريغ المقابلات الصوتية (عربي) → إكسل + تحليل نصي")
+st.title("📝 تفريغ المقابلات الصوتية (عربي) → إكسل + تحليل نصي (بدون تحويل صيغ)")
 
-st.caption("ارفع ملفات الصوت، أدخِل بيانات كل ملف (إن رغبت)، سنُفرِّغ النص بالعربية ونُخرج النتائج في ملف إكسل واحد. يمكن أيضًا إجراء تحليل نصي اختياري.")
+st.caption("ارفع ملفات الصوت بصيغة مدعومة، أدخِل بيانات كل ملف (إن رغبت)، سنُفرِّغ النص بالعربية ونُخرج النتائج في ملف إكسل واحد. يمكن أيضًا إجراء تحليل نصي اختياري.")
 
 # ========================= مفاتيح وأمان =========================
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") if "OPENAI_API_KEY" in st.secrets else None
@@ -29,7 +30,7 @@ if not OPENAI_API_KEY:
         )
 
 if not OPENAI_API_KEY:
-    st.info("لم يتم العثور على مفتاح API. لن يعمل التفريغ قبل إدخاله.", icon="🔑")
+    st.info("لن يعمل التفريغ قبل إدخال مفتاح OpenAI API.", icon="🔑")
 
 # ========================= الشريط الجانبي: الإعدادات =========================
 with st.sidebar:
@@ -57,71 +58,33 @@ with st.sidebar:
     st.caption("ملاحظة: الأسعار هنا افتراضية وقابلة للتعديل لتطابق حسابك.")
 
 # ========================= أدوات مساعدة =========================
-
 SUPPORTED_AUDIO = ['flac', 'm4a', 'mp3', 'mp4', 'mpeg', 'mpga', 'oga', 'ogg', 'wav', 'webm']
 
 def _get_file_ext(name: str) -> str:
     return (os.path.splitext(name)[1][1:] or "").lower()
 
-def _convert_to_mp3_in_memory(file_bytes: bytes, src_ext: str) -> Tuple[bytes, str, str, float]:
+def _safe_duration_seconds(file_name: str, data: bytes) -> float:
     """
-    يحوّل الملف إلى MP3 داخل الذاكرة باستخدام pydub/ffmpeg (استيراد كسول).
-    يعيد: (mp3_bytes, new_ext, mime, duration_seconds).
-    ملاحظة: يتطلب pydub + pyaudioop على Python 3.13 + ffmpeg من packages.txt.
+    يحاول قراءة مدة الصوت باستخدام mutagen (بدون FFmpeg).
+    إن فشل لسبب ما، يعيد -1.
     """
     try:
-        from pydub import AudioSegment  # lazy import
-    except Exception as e:
-        raise RuntimeError(
-            "التحويل إلى MP3 يتطلب وجود pydub و pyaudioop (على Python 3.13) بالإضافة إلى ffmpeg. "
-            "تأكد من تحديث requirements.txt وإضافة ffmpeg في packages.txt."
-        ) from e
-
-    from io import BytesIO
-    src_buf = BytesIO(file_bytes)
-    audio = AudioSegment.from_file(src_buf, format=src_ext if src_ext else None)
-    duration_sec = len(audio) / 1000.0
-
-    mp3_buf = BytesIO()
-    audio.export(mp3_buf, format="mp3", bitrate="192k")
-    mp3_buf.seek(0)
-    return mp3_buf.read(), "mp3", "audio/mpeg", duration_sec
-
-def _ensure_supported_audio(file) -> Tuple[bytes, str, str, float]:
-    """
-    يتأكد أن الملف بصيغة مدعومة للتفريغ.
-    إذا لم تكن الصيغة ضمن SUPPORTED_AUDIO يحاول تحويله إلى mp3.
-    يعيد: (bytes, ext, mime, duration_seconds_or_-1_when_unknown)
-    """
-    fbytes = file.read()
-    file.seek(0)
-
-    ext = _get_file_ext(file.name)
-    if ext in SUPPORTED_AUDIO:
-        # محاولة استخراج المدة (تقديريًا) عبر pydub إن أمكن
-        duration_sec = -1.0
-        try:
-            from pydub import AudioSegment
-            from io import BytesIO
-            audio = AudioSegment.from_file(BytesIO(fbytes), format=ext)
-            duration_sec = len(audio) / 1000.0
-        except Exception:
-            pass
-        # حدد MIME مبدئي
-        mime = "audio/" + ("mpeg" if ext in ["mp3", "mpga", "mpeg"] else ext)
-        return fbytes, ext, mime, duration_sec
-
-    # غير مدعوم: حوّل إلى mp3
-    mp3_bytes, new_ext, mime, duration_sec = _convert_to_mp3_in_memory(fbytes, ext)
-    return mp3_bytes, new_ext, mime, duration_sec
+        from mutagen import File as MutagenFile
+        with tempfile.NamedTemporaryFile(delete=True, suffix=f"_{os.path.basename(file_name)}") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            audio = MutagenFile(tmp.name)
+            if audio is not None and getattr(audio, "info", None) and getattr(audio.info, "length", None):
+                return float(audio.info.length)
+        return -1.0
+    except Exception:
+        return -1.0
 
 def transcribe_bytes(client: OpenAI, name: str, content_bytes: bytes, ext: str, language="ar", temperature=0.0) -> str:
     """
     يرسل الملف إلى واجهة التفريغ ويُعيد النص العربي.
     """
     try:
-        # OpenAI SDK: audio.transcriptions.create
-        # نمرر (filename, bytes, mime) إن لزم، ولكن يكفي (name, bytes)
         resp = client.audio.transcriptions.create(
             model=asr_model,
             file=(f"{os.path.splitext(name)[0]}.{ext}", content_bytes),
@@ -132,12 +95,11 @@ def transcribe_bytes(client: OpenAI, name: str, content_bytes: bytes, ext: str, 
         if isinstance(resp, str):
             return resp.strip()
         return getattr(resp, "text", "").strip()
-    except (AuthenticationError) as e:
+    except AuthenticationError as e:
         raise RuntimeError("فشل التوثيق: تحقّق من مفتاح OpenAI API.") from e
-    except (RateLimitError) as e:
+    except RateLimitError as e:
         raise RuntimeError("تجاوزت الحصة/المعدل. راجع خطتك أو أعد المحاولة لاحقًا.") from e
-    except (BadRequestError) as e:
-        # غالبًا بسبب صيغة غير صحيحة
+    except BadRequestError as e:
         raise RuntimeError(f"طلب غير صالح: {e}") from e
     except APIError as e:
         raise RuntimeError(f"خطأ من خادم OpenAI: {e}") from e
@@ -146,7 +108,7 @@ def transcribe_bytes(client: OpenAI, name: str, content_bytes: bytes, ext: str, 
 
 def analyze_text(client: OpenAI, text: str, depth: str) -> Dict[str, Any]:
     """
-    يجري تحليلًا نصيًا بسيطًا عبر نموذج محادثي:
+    تحليل نصي بسيط:
     - ملخص (حسب العمق)
     - كلمات مفتاحية
     - مشاعر عامة
@@ -174,14 +136,12 @@ def analyze_text(client: OpenAI, text: str, depth: str) -> Dict[str, Any]:
             temperature=0.2,
         )
         raw = comp.choices[0].message.content.strip()
-        # محاولة قراءة JSON حتى لو جاء مع التفاف
         import json, re
         match = re.search(r'\{.*\}', raw, re.S)
         data = {}
         if match:
             data = json.loads(match.group(0))
         else:
-            # fallback: نحفظه كنص
             data = {"summary": raw, "keywords": "", "sentiment": ""}
 
         return {
@@ -191,11 +151,10 @@ def analyze_text(client: OpenAI, text: str, depth: str) -> Dict[str, Any]:
             "عدد الكلمات": wc,
         }
     except Exception:
-        # في حال فشل التحليل نعطي المقاييس البسيطة فقط
         return {"ملخص": "", "كلمات مفتاحية": "", "المشاعر": "", "عدد الكلمات": wc}
 
 def minutes_from_seconds(sec: float) -> float:
-    return max(0.0, round(sec / 60.0, 2)) if sec >= 0 else 0.0
+    return max(0.0, round(sec / 60.0, 2)) if sec and sec > 0 else 0.0
 
 # ========================= الإدخال: الملفات + بيانات لكل ملف =========================
 with st.form("upload_form", clear_on_submit=False):
@@ -219,7 +178,6 @@ with st.form("upload_form", clear_on_submit=False):
         default_spec = st.text_input("الاختصاص (افتراضي)")
         per_file_overrides = st.checkbox("سأدخل بيانات مختلفة لكل ملف", value=True)
 
-    # إدخال بيانات لكل ملف على حدة (عند الرغبة)
     per_file_meta: List[Dict[str, str]] = []
     if uploaded_files and per_file_overrides:
         st.markdown("—")
@@ -251,6 +209,15 @@ if submit:
         st.warning("الرجاء رفع ملف صوتي واحد على الأقل.", icon="📎")
         st.stop()
 
+    # تحقّق مبكر من الامتدادات
+    bad_files = [f.name for f in uploaded_files if _get_file_ext(f.name) not in SUPPORTED_AUDIO]
+    if bad_files:
+        st.error(
+            "هذه الملفات غير بصيغة مدعومة، الرجاء تحويلها خارجيًا إلى صيغة مدعومة ثم إعادة الرفع:\n- " + "\n- ".join(bad_files),
+            icon="🚫"
+        )
+        st.stop()
+
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     results_rows: List[Dict[str, Any]] = []
@@ -262,7 +229,7 @@ if submit:
     for i, f in enumerate(uploaded_files, start=1):
         status.info(f"جارٍ معالجة: {f.name} ...")
 
-        # حدد بيانات هذا الملف
+        # بيانات هذا الملف
         if per_file_overrides and len(per_file_meta) >= i:
             meta = per_file_meta[i-1]
         else:
@@ -274,29 +241,19 @@ if submit:
                 "الاختصاص": default_spec,
             }
 
-        # تأكد من الصيغة/حوّل إذا لزم
-        try:
-            data_bytes, ext, mime, duration_sec = _ensure_supported_audio(f)
-        except Exception as e:
-            text = f"خطأ في التحضير/التحويل: {e}"
-            row = {**meta, "المقابلة (النص المفرغ)": text}
-            if enable_nlp:
-                row.update({"ملخص": "", "كلمات مفتاحية": "", "المشاعر": "", "عدد الكلمات": 0})
-            results_rows.append(row)
-            durations_min.append(0.0)
-            progress.progress(i / len(uploaded_files))
-            continue
+        # اقرأ البايتات واحسب مدة تقريبية
+        ext = _get_file_ext(f.name)
+        fbytes = f.read()
+        f.seek(0)
+        duration_sec = _safe_duration_seconds(f.name, fbytes)
 
         # التفريغ
         try:
-            text = transcribe_bytes(client, f.name, data_bytes, ext, language="ar", temperature=asr_temperature)
+            text = transcribe_bytes(client, f.name, fbytes, ext, language="ar", temperature=asr_temperature)
         except Exception as e:
             text = f"خطأ أثناء التفريغ: {e}"
 
-        row = {
-            **meta,
-            "المقابلة (النص المفرغ)": text or "",
-        }
+        row = {**meta, "المقابلة (النص المفرغ)": text or ""}
 
         # التحليل النصي
         if enable_nlp and text and not str(text).startswith("خطأ"):
@@ -356,7 +313,6 @@ if submit:
     else:
         asr_cost = total_minutes * float(price_per_min_whisper)
 
-    # تقدير توكنات التحليل: تقريبي (4 حروف ≈ 1 توكن). عربية قد تختلف.
     total_words = 0
     if enable_nlp:
         try:
@@ -377,8 +333,8 @@ if submit:
 with st.expander("💡 ملاحظات هامة"):
     st.markdown(
         """
-- يدعم التطبيق صيغ الصوت: `flac, m4a, mp3, mp4, mpeg, mpga, oga, ogg, wav, webm`.  
-- إذا رفضت الواجهة صيغة معيّنة، نحاول تحويلها إلى MP3 تلقائيًا (يتطلب `ffmpeg` + `pydub` + `pyaudioop`).
+- يدعم التطبيق صيغ الصوت: `flac, m4a, mp3, mp4, mpeg, mpga, oga, ogg, wav, webm`.
+- لا يوجد تحويل صيغ داخل التطبيق لتجنّب مشاكل البناء على Streamlit Cloud.
 - لو ظهرت أخطاء **401** تأكّد من مفتاح OpenAI. لو **429** (حصة/معدل) راجع الفوترة أو أعد المحاولة.
 - الأسعار في الحاسبة **تقديرية** ويمكن تعديلها من الشريط الجانبي.
 - لا تحفظ مفتاحك داخل الكود أو GitHub. استخدم **Secrets** على Streamlit Cloud أو الحقل المؤقت.
