@@ -3,3 +3,7 @@ openai>=1.40.0
 pandas>=2.2.2
 openpyxl>=3.1.2
 mutagen>=1.47.0
+wordcloud==1.9.3
+matplotlib>=3.8.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
